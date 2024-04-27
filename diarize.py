@@ -1,9 +1,9 @@
 import argparse
 import os
 from helpers import *
-from faster_whisper import WhisperModel
 import whisperx
 import torch
+from transformers import pipeline
 from pydub import AudioSegment
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 from deepmultilingualpunctuation import PunctuationModel
@@ -38,7 +38,7 @@ parser.add_argument(
 parser.add_argument(
     "--whisper-model",
     dest="model_name",
-    default="medium.en",
+    default="openai/whisper-medium.en",
     help="name of the Whisper model to use",
 )
 
@@ -54,7 +54,7 @@ parser.add_argument(
     "--language",
     type=str,
     default=None,
-    choices=whisper_langs,
+    choices=whisper_langs + [None],
     help="Language spoken in the audio, specify None to perform language detection",
 )
 
@@ -63,6 +63,13 @@ parser.add_argument(
     dest="device",
     default="cuda" if torch.cuda.is_available() else "cpu",
     help="if you have a GPU use 'cuda', otherwise 'cpu'",
+)
+
+parser.add_argument(
+    "--out-dir",
+    dest="out_dir",
+    default=None,
+    help="Output directory for the results, defaults to the current directory",
 )
 
 args = parser.parse_args()
@@ -91,56 +98,64 @@ else:
 
 
 # Transcribe the audio file
-if args.batch_size != 0:
-    from transcription_helpers import transcribe_batched
-
-    whisper_results, language = transcribe_batched(
-        vocal_target,
-        args.language,
-        args.batch_size,
-        args.model_name,
-        mtypes[args.device],
-        args.suppress_numerals,
-        args.device,
-    )
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=args.model_name,
+    torch_dtype=torch.float16,
+    device_map=args.device,
+    # model_kwargs={"attn_implementation":"flash_attention_2"},
+)
+if args.suppress_numerals:
+    numeral_symbol_tokens = find_numeral_symbol_tokens(pipe.tokenizer)
+    token_list = [[token] for token in numeral_symbol_tokens[1:]]
 else:
-    from transcription_helpers import transcribe
+    token_list = None
 
-    whisper_results, language = transcribe(
-        vocal_target,
-        args.language,
-        args.model_name,
-        mtypes[args.device],
-        args.suppress_numerals,
-        args.device,
-    )
+whisper_results = pipe(
+    vocal_target,
+    chunk_length_s=30,
+    batch_size=args.batch_size,
+    generate_kwargs={
+        "task": "transcribe",
+        "language": args.language,
+        "bad_words_ids": token_list,
+    },
+    return_timestamps=(True if args.language in wav2vec2_langs else "word"),
+)
 
-if language in wav2vec2_langs:
+
+if args.language in wav2vec2_langs:
+    segments = [
+        {
+            "text": chunk["text"],
+            "start": chunk["timestamp"][0],
+            "end": chunk["timestamp"][1],
+        }
+        for chunk in whisper_results["chunks"]
+    ]
     alignment_model, metadata = whisperx.load_align_model(
-        language_code=language, device=args.device
+        language_code=args.language, device=args.device
     )
     result_aligned = whisperx.align(
-        whisper_results, alignment_model, metadata, vocal_target, args.device
+        segments, alignment_model, metadata, vocal_target, args.device
     )
     word_timestamps = filter_missing_timestamps(
         result_aligned["word_segments"],
-        initial_timestamp=whisper_results[0].get("start"),
-        final_timestamp=whisper_results[-1].get("end"),
+        initial_timestamp=segments[0].get("start"),
+        final_timestamp=segments[-1].get("end"),
     )
     # clear gpu vram
     del alignment_model
     torch.cuda.empty_cache()
 else:
-    assert (
-        args.batch_size == 0  # TODO: add a better check for word timestamps existence
-    ), (
-        f"Unsupported language: {language}, use --batch_size to 0"
-        " to generate word timestamps using whisper directly and fix this error."
-    )
-    word_timestamps = []
-    for segment in whisper_results:
-        for word in segment["words"]:
-            word_timestamps.append({"word": word[2], "start": word[0], "end": word[1]})
+    word_timestamps = [
+        {
+            "word": chunk["text"],
+            "start": chunk["timestamp"][0],
+            "end": chunk["timestamp"][1],
+        }
+        for chunk in whisper_results["chunks"]
+    ]
 
 
 # convert audio to mono for NeMo combatibility
@@ -171,7 +186,7 @@ with open(os.path.join(temp_path, "pred_rttms", "mono_file.rttm"), "r") as f:
 
 wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
 
-if language in punct_model_langs:
+if args.language in punct_model_langs:
     # restoring punctuation in the transcript to help realign the sentences
     punct_model = PunctuationModel(model="kredor/punctuate-all")
 
@@ -199,11 +214,16 @@ if language in punct_model_langs:
 
 else:
     logging.warning(
-        f"Punctuation restoration is not available for {language} language. Using the original punctuation."
+        f"Punctuation restoration is not available for {args.language} language. Using the original punctuation."
     )
 
 wsm = get_realigned_ws_mapping_with_punctuation(wsm)
 ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
+
+# write the results to a file in args.out_dir
+if args.out_dir:
+    os.makedirs(args.out_dir, exist_ok=True)
+    os.chdir(args.out_dir)
 
 with open(f"{os.path.splitext(args.audio)[0]}.txt", "w", encoding="utf-8-sig") as f:
     get_speaker_aware_transcript(ssm, f)
