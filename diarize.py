@@ -9,6 +9,7 @@ from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 from deepmultilingualpunctuation import PunctuationModel
 import re
 import logging
+from transformers.utils import is_flash_attn_2_available
 
 mtypes = {"cpu": "int8", "cuda": "float16"}
 
@@ -103,13 +104,17 @@ pipe = pipeline(
     model=args.model_name,
     torch_dtype=torch.float16,
     device_map=args.device,
-    # model_kwargs={"attn_implementation":"flash_attention_2"},
+    model_kwargs={
+        "attn_implementation": (
+            "flash_attention_2" if is_flash_attn_2_available() else "eager"
+        )
+    },
 )
-if args.suppress_numerals:
-    numeral_symbol_tokens = find_numeral_symbol_tokens(pipe.tokenizer)
-    token_list = [[token] for token in numeral_symbol_tokens[1:]]
-else:
-    token_list = None
+# if args.suppress_numerals:
+#     numeral_symbol_tokens = find_numeral_symbol_tokens(pipe.tokenizer)
+#     token_list = [[token] for token in numeral_symbol_tokens[1:]]
+# else:
+#     token_list = None
 
 whisper_results = pipe(
     vocal_target,
@@ -118,11 +123,18 @@ whisper_results = pipe(
     generate_kwargs={
         "task": "transcribe",
         "language": args.language,
-        "bad_words_ids": token_list,
+        # "bad_words_ids": token_list,
+        "output_attentions": False,
     },
     return_timestamps=(True if args.language in wav2vec2_langs else "word"),
 )
 
+# convert audio to mono for NeMo combatibility
+sound = AudioSegment.from_file(vocal_target).set_channels(1)
+ROOT = os.getcwd()
+temp_path = os.path.join(ROOT, "temp_outputs")
+os.makedirs(temp_path, exist_ok=True)
+sound.export(os.path.join(temp_path, "mono_file.wav"), format="wav")
 
 if args.language in wav2vec2_langs:
     segments = [
@@ -133,6 +145,8 @@ if args.language in wav2vec2_langs:
         }
         for chunk in whisper_results["chunks"]
     ]
+    if segments[-1]["end"] is None:
+        segments[-1]["end"] = sound.duration_seconds
     alignment_model, metadata = whisperx.load_align_model(
         language_code=args.language, device=args.device
     )
@@ -157,13 +171,6 @@ else:
         for chunk in whisper_results["chunks"]
     ]
 
-
-# convert audio to mono for NeMo combatibility
-sound = AudioSegment.from_file(vocal_target).set_channels(1)
-ROOT = os.getcwd()
-temp_path = os.path.join(ROOT, "temp_outputs")
-os.makedirs(temp_path, exist_ok=True)
-sound.export(os.path.join(temp_path, "mono_file.wav"), format="wav")
 
 # Initialize NeMo MSDD diarization model
 msdd_model = NeuralDiarizer(cfg=create_config(temp_path)).to(args.device)
